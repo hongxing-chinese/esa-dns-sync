@@ -162,7 +162,7 @@ def fetch_all_ips():
 
         v4_count = len(v4_list)
         v6_count = len(v6_list)
-        print(f"     ✅ [{line_name}] 合并去重后: IPv4 {v4_count} 个{v4_hint}, IPv6 {v6_count} 个{v4_hint if v6_count > 0 else ''}")
+        print(f"     ✅ [{line_name}] 合并去重后: IPv4 {v4_count} 个{limit_hint}, IPv6 {v6_count} 个{limit_hint if v6_count > 0 else ''}")
 
     # 全网默认：三网均衡组合（运营商均衡 + 地区均衡）
     def build_balanced_default(ip_version):
@@ -216,7 +216,7 @@ def fetch_all_ips():
                 break
             idx += 1
 
-        return result
+        return list(dict.fromkeys(result))[:50]
 
     default_v4 = build_balanced_default("v4")
     default_v6 = build_balanced_default("v6")

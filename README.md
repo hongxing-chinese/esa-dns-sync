@@ -1,17 +1,17 @@
 # ESA DNS Sync
 
-通过 Google DoH (DNS-over-HTTPS) + ECS (EDNS Client Subnet) 技术，伪装成不同地区运营商的真实用户网段，向阿里云 CDN 查询最优边缘节点 IP，并自动更新到华为云 DNS 解析的 Python 脚本。
+通过 Google DoH (DNS-over-HTTPS) + ECS (EDNS Client Subnet) 技术，伪装成不同地区运营商的真实用户网段，向目标 CDN 域名查询最优边缘节点 IP，并自动更新到华为云 DNS 解析的 Python 脚本。
 
 ## 原理简介
 
-阿里云 CDN 会根据用户所在网段返回最近的边缘节点。本项目利用 Google 公共 DNS 的 ECS 扩展协议，在查询请求中附加伪造的子网信息（如「北京联通 123.112.0.0/24」），从而"骗"出对应线路的真实边缘节点 IP，再将其写入华为云 DNS 的分线路解析记录。
+阿里云等 CDN 会根据用户所在网段返回最近的边缘节点。本项目利用 Google 公共 DNS 的 ECS 扩展协议，在查询请求中附加伪造的子网信息（如「北京联通 123.112.0.0/24」），从而获取对应线路的真实边缘节点 IP，再将其写入华为云 DNS 的分线路解析记录。
 
 支持的线路：
 - 电信（IPv4 + IPv6）
 - 联通（IPv4 + IPv6）
 - 移动（IPv4 + IPv6）
 - 海外（IPv4 + IPv6）
-- 全网默认（IPv4 + IPv6，三网 IP 并集）
+- 全网默认（IPv4 + IPv6，三网均衡组合）
 
 ## 项目结构
 
@@ -44,7 +44,6 @@ pip install -r requirements.txt
 ### 2. 配置环境变量
 
 ```bash
-cd esa-dns-sync
 cp .env.example .env
 nano .env
 ```
@@ -59,7 +58,7 @@ HUAWEI_SK=你的SecretKey
 # DNS 服务区域
 HUAWEI_REGION=ap-southeast-1
 
-# 飞书自定义机器人 Webhook 地址（ESA 项目独立）
+# 飞书自定义机器人 Webhook 地址
 FEISHU_WEBHOOK_URL_ESA=https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxxx
 
 # 要查询的目标 CDN 域名
@@ -103,7 +102,7 @@ DOMAINS_CONFIG = [
 
 ```bash
 cd /home/esa-dns-sync
-source ../venv/bin/activate
+source ./venv/bin/activate
 python update_esa_dns.py
 ```
 
@@ -113,11 +112,11 @@ python update_esa_dns.py
 🔍 正在通过 Google DoH + ECS 获取 www.aliyun.com 的真实边缘节点 IP...
 
   📡 正在查询 [电信] 线路...
-     ✅ [电信] 合并去重后: IPv4 3 个, IPv6 2 个
+     ✅ [电信] 合并去重后: IPv4 3 个 (每地区最多5), IPv6 2 个 (每地区最多5)
   📡 正在查询 [联通] 线路...
-     ✅ [联通] 合并去重后: IPv4 4 个, IPv6 2 个
+     ✅ [联通] 合并去重后: IPv4 4 个 (每地区最多5), IPv6 2 个 (每地区最多5)
   ...
-     ✅ [全网默认] 三网并集: IPv4 8 个, IPv6 5 个
+     ✅ [全网默认] 三网均衡: IPv4 8 个, IPv6 5 个
 
 🚀 开始同步域名: example.com
   ✅ [example.com] - [电信] IPv4 更新成功! IP: ['1.2.3.4', ...]
@@ -130,8 +129,12 @@ python update_esa_dns.py
 
 ### 1. 上传项目
 
+将项目上传到 `/home/esa-dns-sync` 目录：
+
 ```bash
-git clone https://github.com/hongxing-chinese/esa-dns-sync.git
+cd /home
+git clone <你的仓库地址> esa-dns-sync
+cd esa-dns-sync
 ```
 
 ### 2. 在服务器上创建 .env
@@ -143,7 +146,7 @@ nano .env
 # 填入你的 AK、SK、Webhook 地址
 ```
 
-### 3. 添加定时任务（每 30 分钟执行一次）
+### 3. 添加定时任务（每天 00:45 执行）
 
 ```bash
 crontab -e
@@ -152,7 +155,7 @@ crontab -e
 添加以下行：
 
 ```cron
-*/30 * * * * cd /home/esa-dns-sync && /home/esa-dns-sync/venv/bin/python /home/esa-dns-sync/update_esa_dns.py >> /home/esa-dns-sync/run.log 2>&1
+45 0 * * * cd /home/esa-dns-sync && /home/esa-dns-sync/venv/bin/python /home/esa-dns-sync/update_esa_dns.py >> /home/esa-dns-sync/run.log 2>&1
 ```
 
 查看执行日志：
@@ -169,9 +172,12 @@ tail -f /home/esa-dns-sync/run.log
 |------|---------|--------|
 | 电信 | 101.224.0.0/24 | 上海 |
 | 电信 | 106.120.0.0/24 | 北京 |
+| 联通 | 112.64.0.0/24 | 上海 |
 | 联通 | 123.112.0.0/24 | 北京 |
 | 移动 | 223.166.0.0/24 | 上海 |
+| 移动 | 221.130.0.0/24 | 北京 |
 | 海外 | 8.8.8.0/24 | 美国 Google |
+| 海外 | 1.1.1.0/24 | 美国 Cloudflare |
 
 如需增加或修改网段，编辑 `update_esa_dns.py` 中的 `SUBNETS` 字典即可。
 
