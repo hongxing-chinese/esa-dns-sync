@@ -67,11 +67,11 @@ DOMAINS_CONFIG = [
         "domain_name": "1949101.xyz",
         "zone_id": "ff8080829a924b9b019df6faf543662f",
         "records": {
-            "dianxin":  {"v4": "ff8080829db64170019df6fe14676380", "v6": "ff8080829dbb43ac019df6fdd868518a"},
-            "liantong": {"v4": "ff8080829a924782019df6fee8bc661a", "v6": "ff8080829a9255d4019df6fe93ac010f"},
-            "yidong":   {"v4": "ff8080829db64d69019df6ff90962674", "v6": "ff8080829a923d9f019df6ff492c34cd"},
-            "oversea":  {"v4": "ff8080829a9255d4019df6fcc2f27f08", "v6": "ff8080829a92427d019df6fb944c24cf"},
-            "default":  {"v4": "ff8080829a92427d019df6fd792c2564", "v6": "ff8080829dbb31fd019df6fd49e75cbe"}
+            "dianxin":  {"v4": "ff8080829e0397b9019e08cd1e9a6209", "v6": "ff8080829e0397b9019e08cd1e626207"},
+            "liantong": {"v4": "ff8080829e0397b9019e08cd1efc620d", "v6": "ff8080829e0397b9019e08cd1ece620b"},
+            "yidong":   {"v4": "ff8080829e0397b9019e08cd1f6a6211", "v6": "ff8080829e0397b9019e08cd1f2f620f"},
+            "oversea":  {"v4": "ff8080829e0397b9019e08cd1db56201", "v6": "ff8080829e0397b9019e08cd1d7661ff"},
+            "default":  {"v4": "ff8080829e0397b9019e08cd1e276205", "v6": "ff8080829e0397b9019e08cd1dee6203"}
         }
     }
 ]
