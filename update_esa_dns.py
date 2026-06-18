@@ -1,6 +1,7 @@
 import os
 import time
 import urllib.request
+import urllib.parse
 import json
 from datetime import datetime
 from dotenv import load_dotenv
@@ -24,25 +25,69 @@ TARGET_DOMAIN = os.environ.get("TARGET_DOMAIN", "www.aliyun.com")
 
 # 2. 各地区各运营商的真实 IP 网段 (ECS Client Subnets)
 
-# ---------- 国内三网：每线路 4 地区（上海、北京、广东、四川） ----------
+# ---------- 国内三网：三网默认 + 7 大区（每网段最多取 3 个 IP） ----------
+DOMESTIC_CARRIERS = [
+    ("dianxin", "电信"),
+    ("yidong", "移动"),
+    ("liantong", "联通"),
+]
+CARRIER_KEY_BY_NAME = {name: key for key, name in DOMESTIC_CARRIERS}
+DOMESTIC_DEFAULT_LINE_KEYS = [key for key, _ in DOMESTIC_CARRIERS]
+DOMESTIC_ROUTE_REGION_KEYS = [
+    "huabei",
+    "dongbei",
+    "xibei",
+    "huazhong",
+    "huadong",
+    "huanan",
+    "xinan",
+]
+DOMESTIC_REGION_LINE_KEYS = [
+    f"{region_key}_{carrier_key}"
+    for region_key in DOMESTIC_ROUTE_REGION_KEYS
+    for carrier_key, _ in DOMESTIC_CARRIERS
+]
+DOMESTIC_DEFAULT_SOURCE_AREAS = ["北京", "上海", "广东", "四川"]
+DOMESTIC_MAX_IPS_PER_SUBNET = 3
+DOMESTIC_DEFAULT_MAX_IPS_PER_AREA = 2
+GLOBAL_DEFAULT_MAX_IPS_PER_REGION = 2
+GLOBAL_DEFAULT_MAX_IPS = 16
+
 DOMESTIC_SUBNETS = {
-    "dianxin": [
-        "101.224.0.0/24",  # 上海电信
-        "106.120.0.0/24",  # 北京电信
-        "113.116.0.0/24",  # 广东电信
-        "118.112.0.0/24"   # 四川电信
+    "huabei": [
+        {"area": "北京", "carrier": "电信", "subnet": "219.141.136.0/24"},
+        {"area": "北京", "carrier": "移动", "subnet": "221.130.33.0/24"},
+        {"area": "北京", "carrier": "联通", "subnet": "202.106.0.0/24"},
     ],
-    "liantong": [
-        "112.64.0.0/24",   # 上海联通
-        "123.112.0.0/24",  # 北京联通
-        "120.80.0.0/24",   # 广东联通
-        "119.6.0.0/24"     # 四川联通
+    "dongbei": [
+        {"area": "辽宁", "carrier": "电信", "subnet": "219.148.204.0/24"},
+        {"area": "辽宁", "carrier": "移动", "subnet": "211.137.32.0/24"},
+        {"area": "辽宁", "carrier": "联通", "subnet": "202.96.64.0/24"},
     ],
-    "yidong": [
-        "223.166.0.0/24",  # 上海移动
-        "221.130.0.0/24",  # 北京移动
-        "120.196.0.0/24",  # 广东移动
-        "117.136.64.0/24"  # 四川移动
+    "xibei": [
+        {"area": "陕西", "carrier": "电信", "subnet": "202.100.4.0/24"},
+        {"area": "陕西", "carrier": "移动", "subnet": "211.137.130.0/24"},
+        {"area": "陕西", "carrier": "联通", "subnet": "221.11.1.0/24"},
+    ],
+    "huazhong": [
+        {"area": "湖北", "carrier": "电信", "subnet": "202.103.24.0/24"},
+        {"area": "湖北", "carrier": "移动", "subnet": "211.137.64.0/24"},
+        {"area": "湖北", "carrier": "联通", "subnet": "218.106.127.0/24"},
+    ],
+    "huadong": [
+        {"area": "上海", "carrier": "电信", "subnet": "202.96.209.0/24"},
+        {"area": "上海", "carrier": "移动", "subnet": "211.136.112.0/24"},
+        {"area": "上海", "carrier": "联通", "subnet": "210.22.70.0/24"},
+    ],
+    "huanan": [
+        {"area": "广东", "carrier": "电信", "subnet": "202.96.128.0/24"},
+        {"area": "广东", "carrier": "移动", "subnet": "211.136.192.0/24"},
+        {"area": "广东", "carrier": "联通", "subnet": "210.21.1.0/24"},
+    ],
+    "xinan": [
+        {"area": "四川", "carrier": "电信", "subnet": "118.112.0.0/24"},
+        {"area": "四川", "carrier": "移动", "subnet": "117.136.64.0/24"},
+        {"area": "四川", "carrier": "联通", "subnet": "119.6.0.0/24"},
     ],
 }
 
@@ -68,11 +113,11 @@ OVERSEA_SUBNETS = {
     "za":       ["105.232.0.0/24"],                         # 南非 (Telkom SA)
 }
 
-# ---------- 三级境外路由分组定义 ----------
-# 第一级：特定直连组（独立输出）
+# ---------- 境外线路层级定义 ----------
+# 境外指定地域：独立输出
 TIER1_KEYS = ["hk", "tw", "jp", "sg"]
 
-# 第二级：大洲解析组（由多个地区均衡混合）
+# 境外大洲：由多个指定地域均衡混合
 TIER2_GROUPS = {
     "asia":     ["hk", "tw", "jp", "kr", "sg", "ph"],      # 亚太
     "oceania":  ["au"],                                       # 大洋洲
@@ -82,34 +127,44 @@ TIER2_GROUPS = {
     "af":       ["eg", "za"],                                 # 非洲
 }
 
-# 第三级：境外全局兜底组（由第二级各组均衡混合）
+# 境外默认：由境外大洲均衡混合
 TIER3_KEY = "oversea_default"
 TIER3_SOURCES = ["asia", "oceania", "na", "sa", "eu", "af"]
 
 # 线路名称映射
 LINE_NAME_MAP = {
-    "dianxin":          "电信",
-    "liantong":         "联通",
-    "yidong":           "移动",
+    "dianxin":          "三网默认-电信",
+    "yidong":           "三网默认-移动",
+    "liantong":         "三网默认-联通",
+    "huabei":           "华北",
+    "dongbei":          "东北",
+    "xibei":            "西北",
+    "huazhong":         "华中",
+    "huadong":          "华东",
+    "huanan":           "华南",
+    "xinan":            "西南",
     "default":          "全网默认",
-    # 第一级
+    # 境外指定地域
     "hk":               "🇭🇰 香港",
     "tw":               "🇹🇼 台湾",
     "jp":               "🇯🇵 日本",
     "sg":               "🇸🇬 新加坡",
-    # 第二级
+    # 境外大洲
     "asia":             "🌏 亚太",
     "oceania":          "🌏 大洋洲",
     "na":               "🌎 北美",
     "sa":               "🌎 南美",
     "eu":               "🌍 欧洲",
     "af":               "🌍 非洲",
-    # 第三级
-    "oversea_default":  "🌐 境外兜底",
+    # 境外默认
+    "oversea_default":  "🌐 境外默认",
 }
+for region_key in DOMESTIC_ROUTE_REGION_KEYS:
+    for carrier_key, carrier_name in DOMESTIC_CARRIERS:
+        LINE_NAME_MAP[f"{region_key}_{carrier_key}"] = f"{LINE_NAME_MAP[region_key]}-{carrier_name}"
 
 # 国内线路 key 集合（保留双栈）
-DOMESTIC_LINE_KEYS = {"dianxin", "liantong", "yidong", "default"}
+DOMESTIC_LINE_KEYS = set(DOMESTIC_DEFAULT_LINE_KEYS + DOMESTIC_REGION_LINE_KEYS + ["default"])
 
 # 3. 华为云域名记录配置
 # 国内线路支持 v4 + v6；境外线路仅支持 v4
@@ -118,24 +173,46 @@ DOMAINS_CONFIG = [
         "domain_name": "1949101.xyz",
         "zone_id": "ff8080829a924b9b019df6faf543662f",
         "records": {
-            # ---- 国内三网（保留 IPv6） ----
-            "dianxin":          {"v4": "ff8080829e17ffac019e46bc1e663e2e", "v6": "ff8080829e0397b9019e46bbe06a236b"},
-            "liantong":         {"v4": "ff8080829e180661019e46bca6540a53", "v6": "ff8080829e180661019e46bc6cc30a35"},
-            "yidong":           {"v4": "ff8080829dbb31fd019e46bd3eaa5f22", "v6": "ff8080829dbb46c8019e46bcef760c30"},
+            # ---- 三网默认（支持 IPv6） ----
+            "dianxin":          {"v4": "ff8080829e0397b9019edc2b797c7e97", "v6": "ff8080829e0397b9019edc2b79407e95"},
+            "liantong":         {"v4": "ff8080829e0397b9019edc2b81387ebf", "v6": "ff8080829e0397b9019edc2b80f97ebd"},
+            "yidong":           {"v4": "ff8080829e0397b9019edc2b8a037ee9", "v6": "ff8080829e0397b9019edc2b89c37ee7"},
             "default":          {"v4": "ff8080829db652b9019e46b63dab0293", "v6": "ff8080829dbb3f00019e46b5fc7e5a0c"},
-            # ---- 第一级：特定直连（仅 IPv4） ----
+            # ---- 国内 7 大区 × 三网（支持 IPv6） ----
+            "huabei_dianxin":   {"v4": "ff8080829e0397b9019edc2b80bf7ebb", "v6": "ff8080829e0397b9019edc2b80597eb9"},
+            "huabei_yidong":    {"v4": "ff8080829e0397b9019edc2b92347f0f", "v6": "ff8080829e0397b9019edc2b91d67f0d"},
+            "huabei_liantong":  {"v4": "ff8080829e0397b9019edc2b89827ee5", "v6": "ff8080829e0397b9019edc2b89237ee2"},
+            "dongbei_dianxin":  {"v4": "ff8080829e0397b9019edc2b7f947eb6", "v6": "ff8080829e0397b9019edc2b7f347eb4"},
+            "dongbei_yidong":   {"v4": "ff8080829e0397b9019edc2b91117f0a", "v6": "ff8080829e0397b9019edc2b90ae7f07"},
+            "dongbei_liantong": {"v4": "ff8080829e0397b9019edc2b88577edf", "v6": "ff8080829e0397b9019edc2b87f27edd"},
+            "xibei_dianxin":    {"v4": "ff8080829e0397b9019edc2b7e7c7eb1", "v6": "ff8080829e0397b9019edc2b7e157eaf"},
+            "xibei_yidong":     {"v4": "ff8080829e0397b9019edc2b8feb7f04", "v6": "ff8080829e0397b9019edc2b8f8a7f02"},
+            "xibei_liantong":   {"v4": "ff8080829e0397b9019edc2b871e7eda", "v6": "ff8080829e0397b9019edc2b86c97ed8"},
+            "huazhong_dianxin": {"v4": "ff8080829e0397b9019edc2b7d567eac", "v6": "ff8080829e0397b9019edc2b7cf87eaa"},
+            "huazhong_yidong":  {"v4": "ff8080829e0397b9019edc2b8ebd7efd", "v6": "ff8080829e0397b9019edc2b8e607efb"},
+            "huazhong_liantong": {"v4": "ff8080829e0397b9019edc2b85fc7ed5", "v6": "ff8080829e0397b9019edc2b858f7ed2"},
+            "huadong_dianxin":  {"v4": "ff8080829e0397b9019edc2b7c3d7ea7", "v6": "ff8080829e0397b9019edc2b7be77ea5"},
+            "huadong_yidong":   {"v4": "ff8080829e0397b9019edc2b8d9a7ef8", "v6": "ff8080829e0397b9019edc2b8d3a7ef6"},
+            "huadong_liantong": {"v4": "ff8080829e0397b9019edc2b84c77ecf", "v6": "ff8080829e0397b9019edc2b84667ecd"},
+            "huanan_dianxin":   {"v4": "ff8080829e0397b9019edc2b7b247ea1", "v6": "ff8080829e0397b9019edc2b7ac57e9f"},
+            "huanan_yidong":    {"v4": "ff8080829e0397b9019edc2b8c797ef3", "v6": "ff8080829e0397b9019edc2b8c137ef1"},
+            "huanan_liantong":  {"v4": "ff8080829e0397b9019edc2b83a07eca", "v6": "ff8080829e0397b9019edc2b83417ec8"},
+            "xinan_dianxin":    {"v4": "ff8080829e0397b9019edc2b79ff7e9c", "v6": "ff8080829e0397b9019edc2b79be7e99"},
+            "xinan_yidong":     {"v4": "ff8080829e0397b9019edc2b8b4e7eee", "v6": "ff8080829e0397b9019edc2b8aea7eec"},
+            "xinan_liantong":   {"v4": "ff8080829e0397b9019edc2b82687ec5", "v6": "ff8080829e0397b9019edc2b82087ec3"},
+            # ---- 境外指定地域（仅 IPv4） ----
             "hk":               {"v4": "ff8080829dbb3f00019e46baded45c4c"},
             "tw":               {"v4": "ff8080829db64170019e46baa02f3aab"},
             "jp":               {"v4": "ff8080829db652b9019e46ba535a0394"},
             "sg":               {"v4": "ff8080829e1802e4019e46ba04bd5ac1"},
-            # ---- 第二级：大洲解析组（仅 IPv4） ----
+            # ---- 境外大洲（仅 IPv4） ----
             "asia":             {"v4": "ff8080829dbb31fd019e46b930625ddf"},
             "oceania":          {"v4": "ff8080829dbb31fd019e46b8e22e5dce"},
             "na":               {"v4": "ff8080829e180661019e46b8a307057d"},
             "sa":               {"v4": "ff8080829e180661019e46b85fcd0548"},
             "eu":               {"v4": "ff8080829db652b9019e46b8087102e7"},
             "af":               {"v4": "ff8080829e180661019e46b78f8c042b"},
-            # ---- 第三级：境外全局兜底（仅 IPv4） ----
+            # ---- 境外默认（仅 IPv4） ----
             "oversea_default":  {"v4": "ff8080829db652b9019e46b70c5202bd"},
         }
     }
@@ -143,17 +220,43 @@ DOMAINS_CONFIG = [
 
 # ================= 工具函数 =================
 
+DOMESTIC_DOH_ENDPOINT = "https://doh.pub/dns-query"
+OVERSEA_DOH_ENDPOINT = "https://dns.google/resolve"
+
+
+def is_domestic_ecs_subnet(subnet):
+    """
+    判断 ECS 网段是否属于国内线路配置。
+    不使用 IP 前缀粗判，避免香港等境外网段被误分流到国内 DoH。
+    """
+    return any(
+        subnet == item["subnet"]
+        for subnets in DOMESTIC_SUBNETS.values()
+        for item in subnets
+    )
+
 
 def resolve_with_ecs(domain, subnet, record_type='A'):
     """
-    使用 Google DoH API，带上伪造的子网 IP 进行查询
+    使用 DoH + ECS 查询 CDN 边缘节点 IP。
+    国内网段走腾讯云 doh.pub，境外网段继续走 Google DoH。
     """
     qtype = "1" if record_type == "A" else "28"
-    url = f"https://dns.google/resolve?name={domain}&type={qtype}&edns_client_subnet={subnet}"
+    endpoint = DOMESTIC_DOH_ENDPOINT if is_domestic_ecs_subnet(subnet) else OVERSEA_DOH_ENDPOINT
+    resolver_name = "腾讯云 doh.pub" if endpoint == DOMESTIC_DOH_ENDPOINT else "Google DoH"
+    query = urllib.parse.urlencode({
+        "name": domain,
+        "type": qtype,
+        "edns_client_subnet": subnet,
+    }, safe="/")
+    url = f"{endpoint}?{query}"
 
     ips = []
     try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        req = urllib.request.Request(url, headers={
+            'User-Agent': 'Mozilla/5.0',
+            'Accept': 'application/dns-json',
+        })
         response = urllib.request.urlopen(req, timeout=10)
         data = json.loads(response.read().decode('utf-8'))
 
@@ -162,7 +265,7 @@ def resolve_with_ecs(domain, subnet, record_type='A'):
                 if str(answer['type']) == qtype:
                     ips.append(answer['data'])
     except Exception as e:
-        print(f"    ⚠️  使用网段 {subnet} 查询 {record_type} 失败: {e}")
+        print(f"    [WARN] 使用 {resolver_name} + 网段 {subnet} 查询 {record_type} 失败: {e}")
 
     return ips
 
@@ -206,54 +309,65 @@ def round_robin_merge(ip_groups, max_total=MAX_RECORDS_PER_SET):
 def fetch_all_ips():
     """
     遍历所有线路和网段抓取 IP，返回聚合结果。
-    - 国内三网：保留 IPv4 + IPv6 双栈，每地区最多 5 个
+    - 国内三网：保留 IPv4 + IPv6 双栈，每个地区/运营商网段最多 3 个
+    - 三网默认：按运营商拆成电信/移动/联通三条，北上广川每地区前 2 个
+    - 国内大区：按大区 + 运营商拆分记录
     - 境外所有分组：仅查询 IPv4，不查 IPv6
-    - 全网默认：三网均衡组合
+    - 全网默认：国内 7 大区每区前 2 个，最多 16 个
     """
-    print(f"🔍 正在通过 Google DoH + ECS 获取 {TARGET_DOMAIN} 的真实边缘节点 IP...\n")
+    print(f"🔍 正在通过智能分流 DoH + ECS 获取 {TARGET_DOMAIN} 的真实边缘节点 IP...\n")
 
-    # ---------- 阶段一：查询国内三网 ----------
+    # ---------- 阶段一：查询国内三网大区 ----------
     print("=" * 55)
-    print("📌 阶段一：国内三网（IPv4 + IPv6 双栈）")
+    print("📌 阶段一：国内三网大区（IPv4 + IPv6 双栈）")
     print("=" * 55)
 
     line_results = {}
-    domestic_region_names = ["上海", "北京", "广东", "四川"]
+    domestic_default_results = {
+        carrier_key: {area: {"v4": [], "v6": []} for area in DOMESTIC_DEFAULT_SOURCE_AREAS}
+        for carrier_key in DOMESTIC_DEFAULT_LINE_KEYS
+    }
 
-    for line, subnets in DOMESTIC_SUBNETS.items():
-        line_name = LINE_NAME_MAP.get(line, line)
-        print(f"  📡 正在查询 [{line_name}] ...")
+    for region_key in DOMESTIC_ROUTE_REGION_KEYS:
+        entries = DOMESTIC_SUBNETS[region_key]
+        region_name = LINE_NAME_MAP.get(region_key, region_key)
+        print(f"  📡 正在查询 [{region_name}] ...")
 
-        region_v4 = {}
-        region_v6 = {}
-
-        for idx, subnet in enumerate(subnets):
-            region_name = domestic_region_names[idx] if idx < len(domestic_region_names) else f"地区{idx+1}"
+        for item in entries:
+            area = item["area"]
+            carrier = item["carrier"]
+            carrier_key = CARRIER_KEY_BY_NAME[carrier]
+            subnet = item["subnet"]
+            line_key = f"{region_key}_{carrier_key}"
 
             v4_res = resolve_with_ecs(TARGET_DOMAIN, subnet, 'A')
+            v4_limited = []
             if v4_res:
-                region_v4[region_name] = v4_res
+                v4_limited = v4_res[:DOMESTIC_MAX_IPS_PER_SUBNET]
 
             v6_res = resolve_with_ecs(TARGET_DOMAIN, subnet, 'AAAA')
+            v6_limited = []
             if v6_res:
-                region_v6[region_name] = v6_res
+                v6_limited = v6_res[:DOMESTIC_MAX_IPS_PER_SUBNET]
 
+            line_results[line_key] = {
+                "v4": list(dict.fromkeys(v4_limited)),
+                "v6": list(dict.fromkeys(v6_limited)),
+            }
+
+            if area in DOMESTIC_DEFAULT_SOURCE_AREAS:
+                domestic_default_results[carrier_key][area]["v4"].extend(v4_limited)
+                domestic_default_results[carrier_key][area]["v6"].extend(v6_limited)
+
+            print(f"     ✅ [{region_name}-{carrier}] IPv4 {len(v4_limited)} 个, IPv6 {len(v6_limited)} 个")
             time.sleep(0.2)
 
-        # 每地区最多 5 个，按地区顺序合并
-        v4_list = []
-        v6_list = []
-        for region in domestic_region_names:
-            if region in region_v4:
-                v4_list.extend(region_v4[region][:5])
-            if region in region_v6:
-                v6_list.extend(region_v6[region][:5])
+    for carrier_key, carrier_name in DOMESTIC_CARRIERS:
+        default_v4 = build_china_default(domestic_default_results, carrier_key, "v4")
+        default_v6 = build_china_default(domestic_default_results, carrier_key, "v6")
+        line_results[carrier_key] = {"v4": default_v4, "v6": default_v6}
+        print(f"  ✅ [三网默认-{carrier_name}] IPv4 {len(default_v4)} 个, IPv6 {len(default_v6)} 个（北上广川每地区最多2）")
 
-        v4_list = list(dict.fromkeys(v4_list))
-        v6_list = list(dict.fromkeys(v6_list))
-
-        line_results[line] = {"v4": v4_list, "v6": v6_list}
-        print(f"     ✅ [{line_name}] IPv4 {len(v4_list)} 个, IPv6 {len(v6_list)} 个（每地区最多5）")
 
     # ---------- 阶段二：查询境外各地区（仅 IPv4） ----------
     print(f"\n{'=' * 55}")
@@ -276,22 +390,22 @@ def fetch_all_ips():
         region_ips[region_key] = all_v4
         print(f"     ✅ [{region_name}] IPv4 {len(all_v4)} 个")
 
-    # ---------- 阶段三：构建三级路由分组 ----------
+    # ---------- 阶段三：构建境外分层线路 ----------
     print(f"\n{'=' * 55}")
-    print("📌 阶段三：构建三级境外路由分组（均衡轮询）")
+    print("📌 阶段三：构建境外分层线路（均衡轮询）")
     print("=" * 55)
 
-    # --- 第一级：特定直连组（直接使用对应地区 IP，上限 50） ---
-    print("\n  🏷️  第一级 — 特定直连组：")
+    # --- 境外指定地域：直接使用对应地区 IP，上限 50 ---
+    print("\n  🏷️  境外指定地域：")
     for key in TIER1_KEYS:
         ips = region_ips.get(key, [])[:MAX_RECORDS_PER_SET]
         line_results[key] = {"v4": ips, "v6": []}
         name = LINE_NAME_MAP.get(key, key)
         print(f"     {name}: IPv4 {len(ips)} 个")
 
-    # --- 第二级：大洲解析组（从多个地区均衡轮询） ---
-    print("\n  🏷️  第二级 — 大洲解析组：")
-    tier2_ips = {}  # 保存第二级结果，供第三级使用
+    # --- 境外大洲：从多个指定地域均衡轮询 ---
+    print("\n  🏷️  境外大洲：")
+    tier2_ips = {}  # 保存境外大洲结果，供境外默认使用
     for group_key, source_keys in TIER2_GROUPS.items():
         ip_groups = {}
         for sk in source_keys:
@@ -306,8 +420,8 @@ def fetch_all_ips():
         sources_desc = "+".join(source_keys)
         print(f"     {name} ({sources_desc}): IPv4 {len(merged)} 个")
 
-    # --- 第三级：境外全局兜底组（从第二级各组均衡轮询） ---
-    print("\n  🏷️  第三级 — 境外全局兜底组：")
+    # --- 境外默认：从境外大洲均衡轮询 ---
+    print("\n  🏷️  境外默认：")
     tier3_ip_groups = {}
     for gk in TIER3_SOURCES:
         if tier2_ips.get(gk):
@@ -318,9 +432,9 @@ def fetch_all_ips():
     name = LINE_NAME_MAP.get(TIER3_KEY, TIER3_KEY)
     print(f"     {name}: IPv4 {len(oversea_default)} 个")
 
-    # ---------- 阶段四：构建全网默认（国内三网均衡） ----------
+    # ---------- 阶段四：构建全网默认（国内大区均衡） ----------
     print(f"\n{'=' * 55}")
-    print("📌 阶段四：全网默认（国内三网均衡，IPv4 + IPv6）")
+    print("📌 阶段四：全网默认（国内大区均衡，IPv4 + IPv6）")
     print("=" * 55)
 
     default_v4 = build_balanced_default(line_results, "v4")
@@ -336,7 +450,8 @@ def fetch_all_ips():
     print(f"  {'─'*14} {'─'*6}  {'─'*6}  {'─'*20}")
 
     summary_order = (
-        ["dianxin", "liantong", "yidong"]
+        DOMESTIC_DEFAULT_LINE_KEYS
+        + DOMESTIC_REGION_LINE_KEYS
         + TIER1_KEYS
         + list(TIER2_GROUPS.keys())
         + [TIER3_KEY, "default"]
@@ -348,7 +463,7 @@ def fetch_all_ips():
         v4c = len(line_results[key]["v4"])
         v6c = len(line_results[key]["v6"])
         note = ""
-        if key in {"dianxin", "liantong", "yidong", "default"}:
+        if key in DOMESTIC_LINE_KEYS:
             note = "双栈"
         elif key in OVERSEA_SUBNETS or key in TIER2_GROUPS or key == TIER3_KEY:
             note = "仅IPv4"
@@ -357,55 +472,29 @@ def fetch_all_ips():
     return line_results
 
 
-def build_balanced_default(line_results, ip_version):
-    """从国内三网 IP 中按地区轮询抽取，确保运营商和地区比例都相当"""
-    dianxin_ips = line_results["dianxin"][ip_version]
-    liantong_ips = line_results["liantong"][ip_version]
-    yidong_ips = line_results["yidong"][ip_version]
-
-    networks = {
-        "电信": dianxin_ips,
-        "联通": liantong_ips,
-        "移动": yidong_ips
-    }
-    active_networks = sum(1 for ips in networks.values() if ips)
-
-    if active_networks == 0:
-        return []
-
-    base_count = 50 // active_networks
+def build_china_default(domestic_default_results, carrier_key, ip_version):
+    """三网默认：指定运营商从北上广川每地区取前 2 个，最多 8 个。"""
     result = []
+    for area in DOMESTIC_DEFAULT_SOURCE_AREAS:
+        result.extend(
+            domestic_default_results
+            .get(carrier_key, {})
+            .get(area, {})
+            .get(ip_version, [])[:DOMESTIC_DEFAULT_MAX_IPS_PER_AREA]
+        )
+    return list(dict.fromkeys(result))[:len(DOMESTIC_DEFAULT_SOURCE_AREAS) * DOMESTIC_DEFAULT_MAX_IPS_PER_AREA]
 
-    # 第一轮：每网按地区轮询取 base_count 个
-    for net_name, ips in networks.items():
-        taken = 0
-        round_idx = 0
-        while taken < base_count and round_idx < 5:
-            for region_offset in [0, 5, 10, 15]:
-                idx = region_offset + round_idx
-                if idx < len(ips) and taken < base_count:
-                    result.append(ips[idx])
-                    taken += 1
-            round_idx += 1
 
-    # 第二轮：剩余名额轮询补充
-    remaining = 50 - len(result)
-    idx = 0
-    while remaining > 0 and idx < 100:
-        added = False
-        for net_name, ips in networks.items():
-            already_taken = sum(1 for ip in result if ip in ips)
-            if already_taken < len(ips):
-                result.append(ips[already_taken])
-                remaining -= 1
-                added = True
-                if remaining == 0:
-                    break
-        if not added:
-            break
-        idx += 1
-
-    return list(dict.fromkeys(result))[:50]
+def build_balanced_default(line_results, ip_version):
+    """全网默认：从国内 7 大区各取前 2 个，最多 16 个。"""
+    result = []
+    for region_key in DOMESTIC_ROUTE_REGION_KEYS:
+        region_groups = {
+            carrier_key: line_results.get(f"{region_key}_{carrier_key}", {}).get(ip_version, [])
+            for carrier_key, _ in DOMESTIC_CARRIERS
+        }
+        result.extend(round_robin_merge(region_groups, max_total=GLOBAL_DEFAULT_MAX_IPS_PER_REGION))
+    return list(dict.fromkeys(result))[:GLOBAL_DEFAULT_MAX_IPS]
 
 
 # ================= 华为云 DNS 更新 =================
@@ -473,7 +562,8 @@ def send_feishu_notification(line_results, all_results):
     # 构建各线路 IP 获取情况摘要
     summary_lines = []
     summary_order = (
-        ["dianxin", "liantong", "yidong"]
+        DOMESTIC_DEFAULT_LINE_KEYS
+        + DOMESTIC_REGION_LINE_KEYS
         + TIER1_KEYS
         + list(TIER2_GROUPS.keys())
         + [TIER3_KEY, "default"]
@@ -577,7 +667,7 @@ def main():
         print("错误：未配置 HUAWEI_AK 或 HUAWEI_SK，请检查 .env 文件")
         return
 
-    # 1. 通过 Google DoH + ECS 获取各线路 IP
+    # 1. 通过智能分流 DoH + ECS 获取各线路 IP
     line_results = fetch_all_ips()
 
     # 2. 初始化华为云 SDK 客户端
@@ -592,7 +682,8 @@ def main():
 
     # 构建更新顺序：国内（双栈） -> 境外（仅v4）
     update_order = (
-        ["dianxin", "liantong", "yidong"]
+        DOMESTIC_DEFAULT_LINE_KEYS
+        + DOMESTIC_REGION_LINE_KEYS
         + TIER1_KEYS
         + list(TIER2_GROUPS.keys())
         + [TIER3_KEY, "default"]
