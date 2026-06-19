@@ -220,8 +220,23 @@ DOMAINS_CONFIG = [
 
 # ================= 工具函数 =================
 
-DOMESTIC_DOH_ENDPOINT = "https://doh.pub/dns-query"
-OVERSEA_DOH_ENDPOINT = "https://dns.google/resolve"
+DOH_RESOLVERS = {
+    "tencent": {
+        "name": "腾讯云 doh.pub",
+        "endpoint": "https://doh.pub/dns-query",
+    },
+    "alidns": {
+        "name": "阿里云 dns.alidns.com",
+        "endpoint": "https://dns.alidns.com/resolve",
+    },
+    "google": {
+        "name": "Google DoH",
+        "endpoint": "https://dns.google/resolve",
+    },
+}
+DOMESTIC_DOH_CHAIN = ["tencent", "alidns", "google"]
+OVERSEA_DOH_CHAIN = ["google", "tencent", "alidns"]
+DOH_RETRIES_PER_RESOLVER = 2
 
 
 def is_domestic_ecs_subnet(subnet):
@@ -239,35 +254,53 @@ def is_domestic_ecs_subnet(subnet):
 def resolve_with_ecs(domain, subnet, record_type='A'):
     """
     使用 DoH + ECS 查询 CDN 边缘节点 IP。
-    国内网段走腾讯云 doh.pub，境外网段继续走 Google DoH。
+    国内网段优先走腾讯云 doh.pub，境外网段优先走 Google DoH。
+    任一 DoH 不可达、握手超时或未返回目标记录时，自动切换备用 DoH。
     """
     qtype = "1" if record_type == "A" else "28"
-    endpoint = DOMESTIC_DOH_ENDPOINT if is_domestic_ecs_subnet(subnet) else OVERSEA_DOH_ENDPOINT
-    resolver_name = "腾讯云 doh.pub" if endpoint == DOMESTIC_DOH_ENDPOINT else "Google DoH"
-    query = urllib.parse.urlencode({
-        "name": domain,
-        "type": qtype,
-        "edns_client_subnet": subnet,
-    }, safe="/")
-    url = f"{endpoint}?{query}"
+    resolver_chain = DOMESTIC_DOH_CHAIN if is_domestic_ecs_subnet(subnet) else OVERSEA_DOH_CHAIN
+    query = urllib.parse.urlencode(
+        {
+            "name": domain,
+            "type": qtype,
+            "edns_client_subnet": subnet,
+        },
+        safe="/",
+    )
+    errors = []
 
-    ips = []
-    try:
-        req = urllib.request.Request(url, headers={
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/dns-json',
-        })
-        response = urllib.request.urlopen(req, timeout=10)
-        data = json.loads(response.read().decode('utf-8'))
+    for resolver_key in resolver_chain:
+        resolver = DOH_RESOLVERS[resolver_key]
+        url = f"{resolver['endpoint']}?{query}"
 
-        if 'Answer' in data:
-            for answer in data['Answer']:
-                if str(answer['type']) == qtype:
-                    ips.append(answer['data'])
-    except Exception as e:
-        print(f"    [WARN] 使用 {resolver_name} + 网段 {subnet} 查询 {record_type} 失败: {e}")
+        for attempt in range(1, DOH_RETRIES_PER_RESOLVER + 1):
+            try:
+                req = urllib.request.Request(url, headers={
+                    'User-Agent': 'Mozilla/5.0',
+                    'Accept': 'application/dns-json',
+                })
+                response = urllib.request.urlopen(req, timeout=10)
+                data = json.loads(response.read().decode('utf-8'))
 
-    return ips
+                ips = []
+                if 'Answer' in data:
+                    for answer in data['Answer']:
+                        if str(answer['type']) == qtype:
+                            ips.append(answer['data'])
+
+                if ips:
+                    return ips
+
+                errors.append(f"{resolver['name']} 无 {record_type} 结果")
+                break
+            except Exception as e:
+                errors.append(f"{resolver['name']} 第 {attempt} 次失败: {e}")
+                if attempt < DOH_RETRIES_PER_RESOLVER:
+                    time.sleep(0.3)
+
+    tail = "; ".join(errors[-3:])
+    print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 失败，所有 DoH 通道均无结果: {tail}")
+    return []
 
 
 MAX_RECORDS_PER_SET = 50  # 华为云单条记录集上限
