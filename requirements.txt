@@ -1,3 +1,4 @@
 python-dotenv>=1.0.0
 huaweicloudsdkcore>=3.1.0
 huaweicloudsdkdns>=3.1.0
+maxminddb>=2.6.0

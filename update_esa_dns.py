@@ -32,6 +32,29 @@ DOMESTIC_CARRIERS = [
     ("liantong", "联通"),
 ]
 CARRIER_KEY_BY_NAME = {name: key for key, name in DOMESTIC_CARRIERS}
+DOMESTIC_CARRIER_ASN_NUMBERS = {
+    "dianxin": {4134, 4812, 4847, 38283},
+    "yidong": {9808, 24400, 56040, 56044, 56048},
+    "liantong": {4808, 4837, 17621, 17622},
+}
+DOMESTIC_REGION_PREFERRED_ASN_NUMBERS = {
+    # IP66 不提供省份字段，只能把明确带地区属性的 ASN 作为优先项。
+    # 未命中这里时，只要仍满足 CN + 运营商，就作为降权候选保留。
+    "huabei": {
+        "liantong": {4808},
+    },
+    "huadong": {
+        "dianxin": {4812},
+        "yidong": {24400},
+        "liantong": {17621},
+    },
+    "huanan": {
+        "liantong": {17622},
+    },
+    "xinan": {
+        "dianxin": {38283},
+    },
+}
 DOMESTIC_DEFAULT_LINE_KEYS = [key for key, _ in DOMESTIC_CARRIERS]
 DOMESTIC_ROUTE_REGION_KEYS = [
     "huabei",
@@ -52,6 +75,10 @@ DOMESTIC_MAX_IPS_PER_SUBNET = 3
 DOMESTIC_DEFAULT_MAX_IPS_PER_AREA = 2
 GLOBAL_DEFAULT_MAX_IPS_PER_REGION = 2
 GLOBAL_DEFAULT_MAX_IPS = 16
+IP66_DB_URL = "https://downloads.ip66.dev/db/ip66.mmdb"
+IP66_DB_PATH = os.path.join(os.path.dirname(__file__), "ip66.mmdb")
+IP66_MAX_QUERY_ROUNDS = int(os.environ.get("IP66_MAX_QUERY_ROUNDS", "5"))
+ENABLE_IP66_VALIDATION = os.environ.get("ENABLE_IP66_VALIDATION", "true").lower() not in {"0", "false", "no"}
 
 DOMESTIC_SUBNETS = {
     "huabei": [
@@ -251,7 +278,129 @@ def is_domestic_ecs_subnet(subnet):
     )
 
 
-def resolve_with_ecs(domain, subnet, record_type='A'):
+def load_ip66_reader():
+    """
+    每次运行尝试下载最新 IP66 MMDB。
+    IP66 不含省市字段，只用于校验国家/洲和 ASN 运营商。
+    """
+    if not ENABLE_IP66_VALIDATION:
+        print("ℹ️  IP66 校验已通过 ENABLE_IP66_VALIDATION 关闭。")
+        return None
+
+    try:
+        import maxminddb
+    except ImportError:
+        print("⚠️  未安装 maxminddb，跳过 IP66 校验。请执行 pip install -r requirements.txt")
+        return None
+
+    try:
+        tmp_path = f"{IP66_DB_PATH}.tmp"
+        urllib.request.urlretrieve(IP66_DB_URL, tmp_path)
+        os.replace(tmp_path, IP66_DB_PATH)
+        print(f"📦 IP66 数据库已更新: {IP66_DB_PATH}")
+    except Exception as e:
+        if os.path.exists(IP66_DB_PATH):
+            print(f"⚠️  IP66 数据库下载失败，使用本地缓存: {e}")
+        else:
+            print(f"⚠️  IP66 数据库下载失败且无本地缓存，跳过 IP 校验: {e}")
+            return None
+
+    try:
+        return maxminddb.open_database(IP66_DB_PATH)
+    except Exception as e:
+        print(f"⚠️  IP66 数据库打开失败，跳过 IP 校验: {e}")
+        return None
+
+
+def ip66_get_record(reader, ip):
+    if not reader:
+        return None
+    try:
+        return reader.get(ip) or {}
+    except Exception:
+        return {}
+
+
+def ip66_country_code(record):
+    return ((record or {}).get("country") or {}).get("iso_code", "")
+
+
+def ip66_asn_org(record):
+    record = record or {}
+    return (
+        record.get("autonomous_system_organization")
+        or ((record.get("asn") or {}).get("organization"))
+        or ""
+    ).upper()
+
+
+def ip66_asn_number(record):
+    record = record or {}
+    return record.get("autonomous_system_number") or ((record.get("asn") or {}).get("number"))
+
+
+def carrier_matches_asn(carrier_key, asn_number, asn_org):
+    if asn_number in DOMESTIC_CARRIER_ASN_NUMBERS.get(carrier_key, set()):
+        return True
+
+    keywords = {
+        "dianxin": ("CHINANET", "CHINA TELECOM", "TELECOM", "CT"),
+        "yidong": ("CHINA MOBILE", "CMCC", "CMNET", "MOBILE"),
+        "liantong": ("CHINA UNICOM", "UNICOM", "CHINA169", "CNCGROUP", "NETCOM"),
+    }
+    return any(keyword in asn_org for keyword in keywords.get(carrier_key, ()))
+
+
+def region_matches_asn(region_key, carrier_key, asn_number):
+    return asn_number in (
+        DOMESTIC_REGION_PREFERRED_ASN_NUMBERS
+        .get(region_key, {})
+        .get(carrier_key, set())
+    )
+
+
+def build_domestic_ip_filter(reader, region_key, carrier_key):
+    if not reader:
+        return None
+
+    def _filter(ip):
+        record = ip66_get_record(reader, ip)
+        asn_number = ip66_asn_number(record)
+        asn_org = ip66_asn_org(record)
+        if ip66_country_code(record) != "CN":
+            return -1
+        if not carrier_matches_asn(carrier_key, asn_number, asn_org):
+            return -1
+        if region_matches_asn(region_key, carrier_key, asn_number):
+            return 2
+        return 1
+
+    return _filter
+
+
+def classify_ip_candidate(ip_filter, ip):
+    if not ip_filter:
+        return 2
+
+    result = ip_filter(ip)
+    if isinstance(result, bool):
+        return 2 if result else -1
+    try:
+        return int(result)
+    except (TypeError, ValueError):
+        return -1
+
+
+def resolve_with_ecs(
+    domain,
+    subnet,
+    record_type='A',
+    ip_filter=None,
+    min_results=1,
+    filter_desc="",
+    prefer_preferred=False,
+    allow_unvalidated_fallback=False,
+):
     """
     使用 DoH + ECS 查询 CDN 边缘节点 IP。
     国内网段优先走腾讯云 doh.pub，境外网段优先走 Google DoH。
@@ -268,38 +417,97 @@ def resolve_with_ecs(domain, subnet, record_type='A'):
         safe="/",
     )
     errors = []
+    candidate_scores = {}
+    candidate_order = []
+    unvalidated_fallback = []
+    unvalidated_seen = set()
 
-    for resolver_key in resolver_chain:
-        resolver = DOH_RESOLVERS[resolver_key]
-        url = f"{resolver['endpoint']}?{query}"
+    def remember_candidate(ip, score):
+        if ip not in candidate_scores:
+            candidate_order.append(ip)
+            candidate_scores[ip] = score
+        elif score > candidate_scores[ip]:
+            candidate_scores[ip] = score
 
-        for attempt in range(1, DOH_RETRIES_PER_RESOLVER + 1):
-            try:
-                req = urllib.request.Request(url, headers={
-                    'User-Agent': 'Mozilla/5.0',
-                    'Accept': 'application/dns-json',
-                })
-                response = urllib.request.urlopen(req, timeout=10)
-                data = json.loads(response.read().decode('utf-8'))
+    def selected_candidates(min_score=1):
+        return [ip for ip in candidate_order if candidate_scores.get(ip, -1) >= min_score]
 
-                ips = []
-                if 'Answer' in data:
-                    for answer in data['Answer']:
-                        if str(answer['type']) == qtype:
-                            ips.append(answer['data'])
+    for query_round in range(1, IP66_MAX_QUERY_ROUNDS + 1):
+        for resolver_key in resolver_chain:
+            resolver = DOH_RESOLVERS[resolver_key]
+            url = f"{resolver['endpoint']}?{query}"
 
-                if ips:
-                    return ips
+            for attempt in range(1, DOH_RETRIES_PER_RESOLVER + 1):
+                try:
+                    req = urllib.request.Request(url, headers={
+                        'User-Agent': 'Mozilla/5.0',
+                        'Accept': 'application/dns-json',
+                    })
+                    response = urllib.request.urlopen(req, timeout=10)
+                    data = json.loads(response.read().decode('utf-8'))
 
-                errors.append(f"{resolver['name']} 无 {record_type} 结果")
-                break
-            except Exception as e:
-                errors.append(f"{resolver['name']} 第 {attempt} 次失败: {e}")
-                if attempt < DOH_RETRIES_PER_RESOLVER:
-                    time.sleep(0.3)
+                    ips = []
+                    if 'Answer' in data:
+                        for answer in data['Answer']:
+                            if str(answer['type']) == qtype:
+                                ips.append(answer['data'])
+
+                    if ips:
+                        valid_count = 0
+                        preferred_count = 0
+                        for ip in ips:
+                            score = classify_ip_candidate(ip_filter, ip)
+                            if score >= 1:
+                                remember_candidate(ip, score)
+                                valid_count += 1
+                                if score >= 2:
+                                    preferred_count += 1
+                            elif allow_unvalidated_fallback and ip not in unvalidated_seen:
+                                unvalidated_seen.add(ip)
+                                unvalidated_fallback.append(ip)
+
+                        preferred_ips = selected_candidates(2)
+                        valid_ips = selected_candidates(1)
+                        if prefer_preferred:
+                            if len(preferred_ips) >= min_results:
+                                return preferred_ips
+                        elif len(valid_ips) >= min_results:
+                            return valid_ips
+                        if ip_filter:
+                            errors.append(
+                                f"{resolver['name']} 第 {query_round} 轮 {valid_count}/{len(ips)} 个符合 {filter_desc}，其中 {preferred_count} 个优先"
+                            )
+                        else:
+                            errors.append(f"{resolver['name']} 第 {query_round} 轮仅获得 {len(ips)} 个 {record_type} 结果")
+                        break
+
+                    errors.append(f"{resolver['name']} 无 {record_type} 结果")
+                    break
+                except Exception as e:
+                    errors.append(f"{resolver['name']} 第 {attempt} 次失败: {e}")
+                    if attempt < DOH_RETRIES_PER_RESOLVER:
+                        time.sleep(0.3)
+
+        if selected_candidates(1) or unvalidated_fallback:
+            time.sleep(0.5)
 
     tail = "; ".join(errors[-3:])
-    print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 失败，所有 DoH 通道均无结果: {tail}")
+    preferred_ips = selected_candidates(2)
+    valid_ips = selected_candidates(1)
+    if prefer_preferred and preferred_ips:
+        preferred_seen = set(preferred_ips)
+        merged = preferred_ips + [ip for ip in valid_ips if ip not in preferred_seen]
+        if len(preferred_ips) < min_results:
+            print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 仅获得 {len(preferred_ips)}/{min_results} 个优先 IP，使用 CN+运营商候选补齐: {tail}")
+        return merged
+    if valid_ips:
+        print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 仅获得 {len(valid_ips)}/{min_results} 个有效 IP: {tail}")
+        return valid_ips
+    if allow_unvalidated_fallback and unvalidated_fallback:
+        print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 未获得通过 IP66 的 IP，兜底使用未校验结果: {tail}")
+        return unvalidated_fallback
+
+    print(f"    [WARN] 使用网段 {subnet} 查询 {record_type} 失败，所有 DoH 通道均无有效结果: {tail}")
     return []
 
 
@@ -349,6 +557,7 @@ def fetch_all_ips():
     - 全网默认：国内 7 大区每区前 2 个，最多 16 个
     """
     print(f"🔍 正在通过智能分流 DoH + ECS 获取 {TARGET_DOMAIN} 的真实边缘节点 IP...\n")
+    ip66_reader = load_ip66_reader()
 
     # ---------- 阶段一：查询国内三网大区 ----------
     print("=" * 55)
@@ -372,13 +581,29 @@ def fetch_all_ips():
             carrier_key = CARRIER_KEY_BY_NAME[carrier]
             subnet = item["subnet"]
             line_key = f"{region_key}_{carrier_key}"
+            ip_filter = build_domestic_ip_filter(ip66_reader, region_key, carrier_key)
+            filter_desc = f"CN/{carrier}/省份ASN优先"
 
-            v4_res = resolve_with_ecs(TARGET_DOMAIN, subnet, 'A')
+            v4_res = resolve_with_ecs(
+                TARGET_DOMAIN,
+                subnet,
+                'A',
+                ip_filter=ip_filter,
+                min_results=DOMESTIC_MAX_IPS_PER_SUBNET,
+                filter_desc=filter_desc,
+                prefer_preferred=True,
+                allow_unvalidated_fallback=True,
+            )
             v4_limited = []
             if v4_res:
                 v4_limited = v4_res[:DOMESTIC_MAX_IPS_PER_SUBNET]
 
-            v6_res = resolve_with_ecs(TARGET_DOMAIN, subnet, 'AAAA')
+            v6_res = resolve_with_ecs(
+                TARGET_DOMAIN,
+                subnet,
+                'AAAA',
+                min_results=DOMESTIC_MAX_IPS_PER_SUBNET,
+            )
             v6_limited = []
             if v6_res:
                 v6_limited = v6_res[:DOMESTIC_MAX_IPS_PER_SUBNET]
@@ -415,8 +640,15 @@ def fetch_all_ips():
 
         all_v4 = []
         for subnet in subnets:
-            v4_res = resolve_with_ecs(TARGET_DOMAIN, subnet, 'A')
+            v4_res = resolve_with_ecs(
+                TARGET_DOMAIN,
+                subnet,
+                'A',
+                min_results=1,
+            )
             all_v4.extend(v4_res)
+            if all_v4:
+                break
             time.sleep(0.2)
 
         all_v4 = list(dict.fromkeys(all_v4))
